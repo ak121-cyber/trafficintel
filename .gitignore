@@ -1,0 +1,91 @@
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# ---------------------------------------------------------------------------
+# Model weights
+#
+# Trained weights are too large for git (traffic_light best.pt / last.pt are
+# 167 MB each, over GitHub's hard 100 MB per-file limit). They stay local and
+# are loaded from models/ at runtime. Training metrics and plots ARE tracked,
+# so results stay reviewable in the repo.
+# ---------------------------------------------------------------------------
+*.pt
+*.pth
+*.onnx
+*.engine
+*.tflite
+
+# ---------------------------------------------------------------------------
+# Datasets
+#
+# Training data (~480 MB) is not redistributed here. datasets/accident.yaml is
+# tracked below so the data layout stays documented.
+# ---------------------------------------------------------------------------
+datasets/**
+!datasets/
+!datasets/*.yaml
+
+# ---------------------------------------------------------------------------
+# Generated media and run artifacts
+# ---------------------------------------------------------------------------
+outputs/
+backend/uploads/
+backend/results/
+
+# Scratch dirs and codec probe files from local debugging
+_baseline/
+_tb2/
+_probe_*.mp4
+_seq_*.mp4
+
+# Video/image media anywhere (test clips are 10-208 MB)
+test_videos/
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# ---------------------------------------------------------------------------
+# Editor / OS
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+# Local editor and tooling config, not part of the project.
+.claude/
+*.swp
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Windows
+*.lnk
+
+# macOS
+.DS_Store
+.AppleDouble
+
+# ---------------------------------------------------------------------------
+# Secrets
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key

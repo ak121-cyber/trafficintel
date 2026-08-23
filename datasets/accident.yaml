@@ -1,0 +1,11 @@
+path: C:\Users\subha\Downloads\TrafficIntel_YOLO26_Final\datasets\accident\hugging
+  face\custom_dataset
+train: images/train
+val: images/val
+names:
+- No Accident
+- Minor Accident
+- Moderate Accident
+- Severe Accident
+- Totaled Vehicle
+nc: 5

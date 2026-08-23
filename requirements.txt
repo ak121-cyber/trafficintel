@@ -1,0 +1,15 @@
+# ML pipeline
+ultralytics>=8.3.0
+opencv-python
+numpy
+PyYAML
+torch
+torchvision
+paddleocr
+paddlepaddle
+
+# Web app (backend/app.py). python-multipart is required by FastAPI to parse
+# the multipart/form-data upload; without it /api/process fails at import time.
+fastapi
+uvicorn[standard]
+python-multipart
