@@ -1,8 +1,10 @@
 """End-to-end API test for the TrafficIntel web backend.
 
-Exercises the real HTTP surface the React frontend uses: upload -> poll -> result.
-Nothing is mocked; each run drives the actual ML pipeline, so it needs the server
-running (`python backend/app.py`) and takes as long as the video does.
+Exercises the real HTTP surface the React frontend uses: register -> upload ->
+poll -> result. Nothing is mocked; each run drives the actual ML pipeline, so it
+needs the server running (`python backend/app.py`) and takes as long as the video
+does. It also needs MongoDB up, because every processing endpoint now requires a
+signed-in account.
 
     python tools/test_api.py                       # accident only
     python tools/test_api.py --traffic-light       # both models, one pass
@@ -13,15 +15,20 @@ Beyond "did it return 200", this asserts the reporting contract that the UI and
 the CLI both depend on: that a motion-only accident reports confidence null
 rather than an invented number, and that violations are never reported unless
 red-light enforcement actually armed. Both are failures that produce
-plausible-looking output, so nothing else would catch them.
+plausible-looking output, so nothing else would catch them. It also checks the
+credit accounting over real HTTP: a rejected upload must cost nothing, and an
+accepted one must cost exactly one video's worth.
 """
 
 from __future__ import annotations
 
 import argparse
+import http.cookiejar
 import json
 import os
+import secrets
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -36,12 +43,54 @@ BASE = "http://127.0.0.1:8000"
 # environment variable so no copy of it lives in this file.
 ACCESS_TOKEN = (os.environ.get("TRAFFICINTEL_ACCESS_TOKEN") or "").strip()
 
+# The login session is an HttpOnly cookie, so requests go through an opener with
+# a cookie jar rather than bare urlopen. This is also how the browser behaves,
+# which is the point of testing the real surface.
+COOKIES = http.cookiejar.CookieJar()
+OPENER = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(COOKIES))
+
 
 def auth_headers(extra: dict | None = None) -> dict:
     headers = dict(extra or {})
     if ACCESS_TOKEN:
         headers["X-Access-Token"] = ACCESS_TOKEN
     return headers
+
+
+def post_json(url: str, payload: dict) -> tuple[int, dict]:
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode(),
+        headers=auth_headers({"Content-Type": "application/json"}),
+        method="POST",
+    )
+    try:
+        with OPENER.open(req) as resp:
+            return resp.status, json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read() or b"{}")
+
+
+def sign_in() -> tuple[int, dict]:
+    """Register a throwaway account and keep its session cookie.
+
+    A fresh account per run rather than a fixed one, for two reasons: there is no
+    password to store anywhere, and the run starts from a known full credit
+    balance, so the credit assertions below are exact instead of relative.
+    """
+    email = f"apitest-{uuid.uuid4().hex[:12]}@trafficintel.local"
+    password = secrets.token_urlsafe(16)
+    return post_json(f"{BASE}/api/auth/register", {
+        "name": "API Test",
+        "email": email,
+        "password": password,
+        "confirm_password": password,
+    })
+
+
+def credits_now() -> int:
+    status, body = get(f"{BASE}/api/auth/me")
+    return body.get("credits_remaining", -1) if status == 200 else -1
 
 
 def post_multipart(url: str, video: Path, fields: dict) -> tuple[int, dict]:
@@ -71,7 +120,7 @@ def post_multipart(url: str, video: Path, fields: dict) -> tuple[int, dict]:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req) as resp:
+        with OPENER.open(req) as resp:
             return resp.status, json.loads(resp.read())
     except urllib.error.HTTPError as exc:
         return exc.code, json.loads(exc.read() or b"{}")
@@ -80,7 +129,7 @@ def post_multipart(url: str, video: Path, fields: dict) -> tuple[int, dict]:
 def get(url: str) -> tuple[int, dict]:
     req = urllib.request.Request(url, headers=auth_headers())
     try:
-        with urllib.request.urlopen(req) as resp:
+        with OPENER.open(req) as resp:
             return resp.status, json.loads(resp.read())
     except urllib.error.HTTPError as exc:
         return exc.code, json.loads(exc.read() or b"{}")
@@ -89,7 +138,7 @@ def get(url: str) -> tuple[int, dict]:
 def head_bytes(url: str, count: int = 64) -> tuple[int, bytes, str]:
     """Fetch the first bytes of a response, to confirm the video really serves."""
     req = urllib.request.Request(url, headers=auth_headers({"Range": f"bytes=0-{count - 1}"}))
-    with urllib.request.urlopen(req) as resp:
+    with OPENER.open(req) as resp:
         return resp.status, resp.read(count), resp.headers.get("Content-Type", "")
 
 
@@ -120,6 +169,39 @@ def main() -> int:
         return 1
     print(f"health      : {health['status']} | device={health['device']['device']}")
 
+    database = health.get("database", {})
+    if not database.get("connected"):
+        print(f"FAIL  MongoDB is not connected: {database.get('error')}")
+        return 1
+
+    # Every processing endpoint requires a session, so the unauthenticated call
+    # is checked first: if this ever returns 202 the whole gate is open. Sent with
+    # a tiny stand-in file rather than the real clip - the session is checked
+    # before the handler body runs, so there is no reason to push megabytes at a
+    # request that is going to be refused.
+    tiny = Path(tempfile.gettempdir()) / "trafficintel_unauth_probe.mp4"
+    tiny.write_bytes(b"\0" * 1024)
+    status, body = post_multipart(f"{BASE}/api/process", tiny,
+                                  {"accident_detection": "true"})
+    tiny.unlink(missing_ok=True)
+    if status != 401:
+        print(f"FAIL  /api/process without a session returned {status} "
+              f"(expected 401)")
+        return 1
+    print(f"unauth      : 401 as expected | {body.get('detail')}")
+
+    status, session = sign_in()
+    if status != 200:
+        print(f"FAIL  registration returned {status}: {session.get('detail')}")
+        return 1
+    limits = health.get("credits", {})
+    print(f"account     : {session['user']['email']} | "
+          f"{session['credits_remaining']}/{session['credits_total']} credits "
+          f"({limits.get('per_video')} per video, "
+          f"{limits.get('videos_per_day')} videos/day)")
+
+    before = credits_now()
+
     # Bad input must be refused before anything is queued. Checked first because a
     # typo silently falling back to the default preset would mean a run reported
     # under a sensitivity nobody selected.
@@ -133,10 +215,20 @@ def main() -> int:
         return 1
     print(f"validation  : 400 as expected | {body.get('detail')}")
 
+    # A refused request must be free. Charging for it would mean a user with a
+    # typo in their form loses a fifth of their day.
+    if credits_now() != before:
+        print(f"FAIL  a rejected upload cost credits: {before} -> {credits_now()}")
+        return 1
+    print(f"credits     : rejected upload cost nothing ({before} still available)")
+
     fields = {
         "accident_detection": str(args.accident).lower(),
         "traffic_light": str(args.traffic_light).lower(),
         "number_plate": str(args.plate).lower(),
+        # One id for this submission. Sent so the duplicate check below can reuse
+        # it; the browser generates the same kind of value per submit.
+        "request_id": uuid.uuid4().hex,
     }
     # Only sent when asked for, so the default run also proves the field is
     # genuinely optional and the server falls back to config.ACCIDENT_SENSITIVITY.
@@ -154,6 +246,26 @@ def main() -> int:
     print(f"upload      : {status} job={job_id} "
           f"{src.get('width')}x{src.get('height')} frames={src.get('frames')} "
           f"({time.time() - t0:.1f}s)")
+
+    charged = before - body.get("credits_remaining", before)
+    if charged != limits.get("per_video"):
+        print(f"FAIL  accepted upload charged {charged} credits, expected "
+              f"{limits.get('per_video')}")
+        return 1
+    print(f"credits     : charged {charged} | {body.get('credits_remaining')} left")
+
+    # A resubmitted request id must be refused rather than charged again. The
+    # frontend sends one id per submission for exactly this reason, so a
+    # double-clicked button cannot cost two videos' worth of credits.
+    status, dup = post_multipart(f"{BASE}/api/process", video, fields)
+    if status != 409:
+        print(f"FAIL  a repeated request_id returned {status} (expected 409)")
+        return 1
+    if credits_now() != body.get("credits_remaining"):
+        print(f"FAIL  the duplicate submission cost credits: "
+              f"{body.get('credits_remaining')} -> {credits_now()}")
+        return 1
+    print(f"duplicate   : 409 no second charge | {dup.get('detail')}")
 
     last = None
     deadline = time.time() + args.timeout
@@ -220,6 +332,14 @@ def main() -> int:
     dstatus, _, _ = head_bytes(f"{BASE}{job['download_url']}", 32)
     print(f"download    : HTTP {dstatus}")
 
+    # The run must show up in the account's history, since that is the only record
+    # of it once the process exits.
+    hstatus, hist = get(f"{BASE}/api/history")
+    rows = hist.get("history", []) if hstatus == 200 else []
+    row = next((r for r in rows if r["job_id"] == job_id), None)
+    print(f"history     : HTTP {hstatus} {len(rows)} row(s) | "
+          f"{row['status'] if row else 'MISSING'}")
+
     # Assertions for the toggle contract.
     ok = True
     if args.accident != s["modules"]["accident_detection"]:
@@ -233,6 +353,13 @@ def main() -> int:
         ok = False
     if vstatus not in (200, 206) or not is_mp4:
         print("FAIL  result video did not serve as MP4")
+        ok = False
+    if row is None or row["status"] != "completed":
+        print("FAIL  the completed job is missing from /api/history")
+        ok = False
+    if row is not None and row["credits_used"] != limits.get("per_video"):
+        print(f"FAIL  history says the job cost {row['credits_used']} credits, "
+              f"expected {limits.get('per_video')}")
         ok = False
 
     # The reporting keys the UI and the CLI both read. If the engine ever stops

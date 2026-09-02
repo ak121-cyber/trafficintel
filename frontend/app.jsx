@@ -1,14 +1,23 @@
 /* TrafficIntel — React frontend.
  *
  * Talks to the FastAPI backend on the same origin:
- *   POST /api/process        upload + toggles -> job_id
+ *   POST /api/auth/register  create an account, sets the session cookie
+ *   POST /api/auth/login     sign in
+ *   GET  /api/auth/me        who am I, and how many credits are left
+ *   POST /api/process        upload + toggles -> job_id (costs credits)
  *   GET  /api/status/{id}    polled until completed / failed
+ *   GET  /api/history        this user's past jobs
  *   GET  /api/result/{id}/video     annotated MP4 for the player
  *   GET  /api/result/{id}/download  same file as an attachment
  *
- * Progress is reported as named stages. A percentage is shown only when the
- * backend actually knows the total frame count; otherwise the bar is
- * indeterminate rather than faking a number.
+ * The session is an HttpOnly cookie, so no token is ever held in JavaScript and
+ * nothing is kept in localStorage. fetch() and XMLHttpRequest both send
+ * same-origin cookies by default, which is why no request below sets a header.
+ *
+ * Routing is by URL hash and needs no router library. Progress is reported as
+ * named stages; a percentage is shown only when the backend actually knows the
+ * total frame count, otherwise the bar is indeterminate rather than faking a
+ * number.
  */
 
 const { useState, useEffect, useRef, useCallback } = React;
@@ -57,6 +66,44 @@ function fmtClock(s) {
   const m = Math.floor(s / 60);
   const sec = Math.floor(s % 60);
   return `${m}:${String(sec).padStart(2, "0")}`;
+}
+
+function fmtWhen(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (isNaN(d)) return "—";
+  return d.toLocaleString(undefined, {
+    day: "numeric", month: "short", hour: "2-digit", minute: "2-digit",
+  });
+}
+
+/* An id for one pending upload, used by the backend to refuse a double submit.
+   crypto.randomUUID is not available on older browsers or over plain http on
+   some of them, so there is a fallback - an id that is merely unlikely to
+   collide is still enough to catch a double-clicked button. */
+function newRequestId() {
+  if (window.crypto && window.crypto.randomUUID) {
+    return window.crypto.randomUUID().replace(/-/g, "");
+  }
+  return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 12)}`;
+}
+
+/* Every call goes through here so that one expired session is handled in one
+   place instead of at each call site. */
+async function api(path, options) {
+  const r = await fetch(path, options);
+  let body = null;
+  try {
+    body = await r.json();
+  } catch (e) {
+    /* some responses have no body; the status still matters */
+  }
+  if (!r.ok) {
+    const err = new Error((body && body.detail) || `Request failed (HTTP ${r.status}).`);
+    err.status = r.status;
+    throw err;
+  }
+  return body;
 }
 
 /* ---------------------------------------------------------------- Switch -- */
@@ -506,10 +553,14 @@ function Result({ job, onReset }) {
   );
 }
 
-/* ------------------------------------------------------------------- App -- */
+/* ------------------------------------------------------------------ Tool -- */
 
-function App() {
-  const [health, setHealth] = useState(null);
+/* The original single-page app, unchanged in behaviour. It is now one route
+   among several, so it takes health and credits from the shell instead of
+   fetching health itself, and reports a spent credit back up so the nav bar
+   updates without a reload. */
+
+function Tool({ health, credits, onCredits, onAuthLost }) {
   const [file, setFile] = useState(null);
   const [opts, setOpts] = useState(() => {
     const o = {};
@@ -523,22 +574,22 @@ function App() {
   const [error, setError] = useState(null);
   const pollRef = useRef(null);
 
+  // One id per pending submission, not per click. Two clicks on Process send the
+  // same id, so the backend refuses the second instead of charging twice; the id
+  // is cleared when a new file is chosen, so reprocessing is never blocked.
+  const submitIdRef = useRef(null);
+
   // Capability probe: modules whose model is missing are disabled in the UI.
   useEffect(() => {
-    fetch("/api/health")
-      .then((r) => r.json())
-      .then((h) => {
-        setHealth(h);
-        setOpts((prev) => {
-          const next = { ...prev };
-          if (h.modules && !h.modules.traffic_light) next.traffic_light = false;
-          if (h.modules && !h.modules.accident_detection) next.accident_detection = false;
-          if (h.modules && !h.modules.number_plate) next.number_plate = false;
-          return next;
-        });
-      })
-      .catch(() => setHealth({ status: "unreachable" }));
-  }, []);
+    if (!health || !health.modules) return;
+    setOpts((prev) => {
+      const next = { ...prev };
+      if (!health.modules.traffic_light) next.traffic_light = false;
+      if (!health.modules.accident_detection) next.accident_detection = false;
+      if (!health.modules.number_plate) next.number_plate = false;
+      return next;
+    });
+  }, [health]);
 
   const stopPolling = () => {
     if (pollRef.current) {
@@ -552,6 +603,14 @@ function App() {
     pollRef.current = setInterval(async () => {
       try {
         const r = await fetch(`/api/status/${jobId}`);
+        if (r.status === 401) {
+          // The session expired mid-job. Stop rather than poll forever, and say
+          // so - the job itself keeps running on the server.
+          stopPolling();
+          setBusy(false);
+          onAuthLost();
+          return;
+        }
         if (!r.ok) throw new Error("status unavailable");
         const j = await r.json();
         setJob(j);
@@ -560,6 +619,14 @@ function App() {
           setBusy(false);
           if (j.status === "failed") setError(j.error || "Processing failed.");
           if (j.status === "cancelled") setError("Processing was cancelled.");
+          // This submission is settled, so retire its id. Pressing Process again
+          // is then a new job and gets charged as one. Without this, cancelling
+          // and retrying the same file reuses the id and the server refuses it
+          // as a duplicate - a dead end, since a cancel is not refunded.
+          submitIdRef.current = null;
+          // A failure is refunded server-side, so re-read the balance rather
+          // than assuming what it is now.
+          onCredits();
         }
       } catch (e) {
         stopPolling();
@@ -567,11 +634,12 @@ function App() {
         setError("Lost contact with the backend. Is the server still running?");
       }
     }, POLL_MS);
-  }, []);
+  }, [onAuthLost, onCredits]);
 
   useEffect(() => stopPolling, []);
 
   const anyAnalysis = opts.accident_detection || opts.traffic_light;
+  const canAfford = !credits || credits.can_process;
 
   const submit = () => {
     if (!file || busy) return;
@@ -580,11 +648,14 @@ function App() {
     setBusy(true);
     setUploadPct(0);
 
+    if (!submitIdRef.current) submitIdRef.current = newRequestId();
+
     const fd = new FormData();
     fd.append("video", file);
     fd.append("accident_detection", opts.accident_detection ? "true" : "false");
     fd.append("traffic_light", opts.traffic_light ? "true" : "false");
     fd.append("number_plate", opts.number_plate ? "true" : "false");
+    fd.append("request_id", submitIdRef.current);
 
     // XHR rather than fetch: it reports real upload progress.
     const xhr = new XMLHttpRequest();
@@ -614,11 +685,20 @@ function App() {
           progress: null,
           warnings: [],
         });
+        onCredits();
         poll(body.job_id);
-      } else {
-        setBusy(false);
-        setError(body.detail || `Upload failed (HTTP ${xhr.status}).`);
+        return;
       }
+
+      setBusy(false);
+      if (xhr.status === 401) {
+        onAuthLost();
+        return;
+      }
+      // 402 means the upload was refused before anything started, so nothing was
+      // charged. Re-read the balance so the number shown is the real one.
+      if (xhr.status === 402) onCredits();
+      setError(body.detail || `Upload failed (HTTP ${xhr.status}).`);
     };
     xhr.onerror = () => {
       setBusy(false);
@@ -645,6 +725,7 @@ function App() {
     setError(null);
     setBusy(false);
     setUploadPct(null);
+    submitIdRef.current = null;
   };
 
   const done = job && job.status === "completed";
@@ -654,10 +735,8 @@ function App() {
     <div className="app">
       <header className="masthead">
         <div className="brand">
-          <h1>
-            Traffic<span className="tick">Intel</span>
-          </h1>
-          <p>AI-Powered Traffic Video Intelligence</p>
+          <h1>Analyse a video</h1>
+          <p>One pass over the footage. Results stay in your history.</p>
         </div>
         <div className="device-chip">
           <span
@@ -675,10 +754,21 @@ function App() {
         </div>
       </header>
 
+      {credits && <CreditMeter c={credits} />}
+
       {error && (
         <div className="notice error">
           <strong>Error</strong>
           {error}
+        </div>
+      )}
+
+      {!busy && !done && !canAfford && (
+        <div className="notice warn">
+          <strong>Out of credits for today</strong>
+          You have used all {credits.videos_per_day} of today’s videos. Your
+          allowance refills automatically after midnight — nothing to click, just
+          come back tomorrow.
         </div>
       )}
 
@@ -747,8 +837,14 @@ function App() {
           </div>
 
           <div className="btn-row">
-            <button className="btn primary" onClick={submit} disabled={!file || !anyAnalysis || busy}>
-              Process Video
+            <button
+              className="btn primary"
+              onClick={submit}
+              disabled={!file || !anyAnalysis || busy || !canAfford}
+            >
+              {canAfford && credits
+                ? `Process Video · ${credits.credits_per_video} credits`
+                : "Process Video"}
             </button>
             {file && (
               <span style={{ fontSize: 13, color: "var(--muted)" }}>
@@ -780,6 +876,697 @@ function App() {
         </span>
       </footer>
     </div>
+  );
+}
+
+/* ----------------------------------------------------------- CreditMeter -- */
+
+function CreditMeter({ c }) {
+  const pct = c.credits_total ? (c.credits_remaining / c.credits_total) * 100 : 0;
+  const low = c.credits_remaining < c.credits_per_video;
+  return (
+    <div className={`credits${low ? " low" : ""}`}>
+      <div className="credits-head">
+        <span className="credits-n">
+          {c.credits_remaining}
+          <span className="credits-of"> / {c.credits_total} credits</span>
+        </span>
+        <span className="credits-sub">
+          {c.videos_today} of {c.videos_per_day} videos today ·{" "}
+          {c.credits_per_video} credits each
+        </span>
+      </div>
+      <div className="credits-bar">
+        <div className="credits-fill" style={{ width: `${pct}%` }} />
+      </div>
+      <p className="credits-note">
+        {low
+          ? "Refills automatically after midnight."
+          : `Enough for ${Math.floor(c.credits_remaining / c.credits_per_video)} more ${
+              Math.floor(c.credits_remaining / c.credits_per_video) === 1 ? "video" : "videos"
+            } today.`}
+      </p>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------- Nav -- */
+
+function Nav({ route, user, credits, onLogout }) {
+  const [open, setOpen] = useState(false);
+
+  // Close the mobile menu on navigation, otherwise it stays open over the page
+  // you just moved to.
+  useEffect(() => {
+    setOpen(false);
+  }, [route]);
+
+  const link = (href, label) => (
+    <a
+      key={href}
+      href={href}
+      className={`nav-link${route === href.slice(1) ? " active" : ""}`}
+    >
+      {label}
+    </a>
+  );
+
+  return (
+    <nav className="nav">
+      <div className="nav-inner">
+        <a className="nav-brand" href="#/">
+          Traffic<span className="tick">Intel</span>
+        </a>
+
+        <button
+          className="nav-toggle"
+          aria-label="Menu"
+          aria-expanded={open}
+          onClick={() => setOpen((v) => !v)}
+        >
+          <span />
+          <span />
+          <span />
+        </button>
+
+        <div className={`nav-links${open ? " open" : ""}`}>
+          {user ? (
+            <React.Fragment>
+              {link("#/dashboard", "Dashboard")}
+              {link("#/tool", "Analyse")}
+              {link("#/history", "History")}
+              {credits && (
+                <a href="#/dashboard" className="nav-credits" title="Credits left today">
+                  <span className="nav-credits-n">{credits.credits_remaining}</span>
+                  <span className="nav-credits-t">/ {credits.credits_total}</span>
+                </a>
+              )}
+              <span className="nav-who" title={user.email}>
+                {user.name}
+              </span>
+              <button className="btn ghost small" onClick={onLogout}>
+                Sign out
+              </button>
+            </React.Fragment>
+          ) : (
+            <React.Fragment>
+              {link("#/", "Home")}
+              {link("#/login", "Sign in")}
+              <a href="#/register" className="btn primary small">
+                Create account
+              </a>
+            </React.Fragment>
+          )}
+        </div>
+      </div>
+    </nav>
+  );
+}
+
+/* ------------------------------------------------------------------ Home -- */
+
+function Home({ user, health }) {
+  // Read the limits from the server rather than hardcoding them: they are
+  // configurable in .env, so a figure written into this file could be wrong.
+  // Until /api/health answers, the sentences below are phrased without numbers
+  // instead of quoting a guess.
+  const credits = (health && health.credits) || null;
+  const hw = health && health.device;
+
+  return (
+    <div className="landing">
+      <section className="hero">
+        <span className="eyebrow">YOLO26M · ByteTrack</span>
+        <h1>
+          Traffic footage in.
+          <br />
+          <span className="tick">Evidence</span> out.
+        </h1>
+        <p className="lede">
+          Upload a clip and get one annotated video back, with confirmed accident
+          events, red-light violations and vehicle counts. One pass over the
+          footage on a single GPU — no cloud, no queue of other people’s jobs.
+        </p>
+        <div className="hero-cta">
+          {user ? (
+            <a className="btn primary" href="#/tool">
+              Analyse a video
+            </a>
+          ) : (
+            <React.Fragment>
+              <a className="btn primary" href="#/register">
+                Create a free account
+              </a>
+              <a className="btn ghost" href="#/login">
+                I already have one
+              </a>
+            </React.Fragment>
+          )}
+        </div>
+        {hw && (
+          <p className="hero-hw">
+            Running on {hw.cuda_available ? hw.gpu_name || "GPU" : "CPU"}
+            {credits &&
+              ` · ${credits.daily} credits a day, ${credits.videos_per_day} videos`}
+          </p>
+        )}
+      </section>
+
+      <section className="features">
+        <article className="feature">
+          <h3>Accident events, not frames</h3>
+          <p>
+            A crash is one incident with an identity and a lifetime. Repeated
+            evidence about the same collision updates that event instead of
+            raising a new alarm every few seconds.
+          </p>
+        </article>
+        <article className="feature">
+          <h3>Red light means all four things</h3>
+          <p>
+            A violation needs a red signal, a tracked vehicle, a measured stop
+            line and a directional crossing. The report says whether enforcement
+            actually armed, so a count of zero is never mistaken for a clean
+            intersection.
+          </p>
+        </article>
+        <article className="feature">
+          <h3>No invented numbers</h3>
+          <p>
+            When the trained model did not confirm an event, the confidence is
+            reported as unknown rather than as a plausible-looking figure. You can
+            see which findings the model agreed with.
+          </p>
+        </article>
+        <article className="feature">
+          <h3>Your history stays yours</h3>
+          <p>
+            Every run is recorded against your account with what it found and what
+            it cost. Videos stay on the machine doing the work — nothing is
+            uploaded anywhere else.
+          </p>
+        </article>
+      </section>
+
+      <section className="how">
+        <h2>How it works</h2>
+        <ol className="steps">
+          <li>
+            <strong>Create an account.</strong>{" "}
+            {credits
+              ? `You get ${credits.daily} credits every day, automatically.`
+              : "You get a fresh allowance of credits every day, automatically."}
+          </li>
+          <li>
+            <strong>Upload a clip</strong> and pick the modules you want.{" "}
+            {credits
+              ? `Each video costs ${credits.per_video} credits, so that is ` +
+                `${credits.videos_per_day} a day.`
+              : "Each video costs a few credits, so there is a daily cap."}
+          </li>
+          <li>
+            <strong>Watch it work.</strong> Named stages, live counts, and a
+            cancel button that actually stops the job.
+          </li>
+          <li>
+            <strong>Review and download</strong> the annotated video, or come back
+            to it later from your history.
+          </li>
+        </ol>
+      </section>
+    </div>
+  );
+}
+
+/* --------------------------------------------------------------- AuthForm -- */
+
+/* Login and registration are the same form with a different field list, so they
+   share one component. Passwords are sent once and never stored client-side. */
+
+function AuthForm({ mode, onDone }) {
+  const isRegister = mode === "register";
+  const [form, setForm] = useState({
+    name: "", email: "", password: "", confirm_password: "",
+  });
+  const [error, setError] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  const set = (k) => (e) => setForm((p) => ({ ...p, [k]: e.target.value }));
+
+  const submit = async (e) => {
+    e.preventDefault();
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const body = isRegister
+        ? form
+        : { email: form.email, password: form.password };
+      const data = await api(`/api/auth/${isRegister ? "register" : "login"}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      // Nothing from the response is persisted: the session is the cookie the
+      // server just set, and the password object goes out of scope here.
+      onDone(data);
+    } catch (err) {
+      setError(err.message);
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="auth-wrap">
+      <form className="auth-card" onSubmit={submit}>
+        <h1>{isRegister ? "Create your account" : "Welcome back"}</h1>
+        <p className="auth-sub">
+          {isRegister
+            ? "Free, and you get a fresh daily allowance of credits."
+            : "Sign in to analyse a video and see your history."}
+        </p>
+
+        {isRegister && (
+          <label>
+            Name
+            <input
+              type="text"
+              value={form.name}
+              onChange={set("name")}
+              autoComplete="name"
+              required
+              autoFocus
+            />
+          </label>
+        )}
+
+        <label>
+          Email
+          <input
+            type="email"
+            value={form.email}
+            onChange={set("email")}
+            autoComplete="email"
+            required
+            autoFocus={!isRegister}
+          />
+        </label>
+
+        <label>
+          Password
+          <input
+            type="password"
+            value={form.password}
+            onChange={set("password")}
+            autoComplete={isRegister ? "new-password" : "current-password"}
+            required
+          />
+        </label>
+
+        {isRegister && (
+          <React.Fragment>
+            <label>
+              Confirm password
+              <input
+                type="password"
+                value={form.confirm_password}
+                onChange={set("confirm_password")}
+                autoComplete="new-password"
+                required
+              />
+            </label>
+            <p className="auth-hint">At least 8 characters.</p>
+          </React.Fragment>
+        )}
+
+        {error && <div className="auth-error">{error}</div>}
+
+        <button className="btn primary block" type="submit" disabled={busy}>
+          {busy
+            ? isRegister
+              ? "Creating account…"
+              : "Signing in…"
+            : isRegister
+            ? "Create account"
+            : "Sign in"}
+        </button>
+
+        <p className="auth-alt">
+          {isRegister ? (
+            <React.Fragment>
+              Already registered? <a href="#/login">Sign in</a>
+            </React.Fragment>
+          ) : (
+            <React.Fragment>
+              No account yet? <a href="#/register">Create one</a>
+            </React.Fragment>
+          )}
+        </p>
+      </form>
+    </div>
+  );
+}
+
+/* -------------------------------------------------------------- Dashboard -- */
+
+function Dashboard({ user, credits, health, onAuthLost }) {
+  const [rows, setRows] = useState(null);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    api("/api/history")
+      .then((d) => setRows(d.history || []))
+      // A 401 here means the session expired while the page was open. Say so on
+      // the login page rather than rendering it as a loading failure.
+      .catch((e) => (e.status === 401 ? onAuthLost() : setError(e.message)));
+  }, [onAuthLost]);
+
+  const done = (rows || []).filter((r) => r.status === "completed");
+  const spent = (rows || []).reduce((n, r) => n + (r.credits_used || 0), 0);
+  const hw = health && health.device;
+
+  return (
+    <div className="app">
+      <header className="masthead">
+        <div className="brand">
+          <h1>Hello, {user.name}</h1>
+          <p>{user.email}</p>
+        </div>
+        <a className="btn primary" href="#/tool">
+          Analyse a video
+        </a>
+      </header>
+
+      {credits && <CreditMeter c={credits} />}
+
+      <div className="tiles">
+        <div className="tile">
+          <span className="tile-n">{rows ? rows.length : "—"}</span>
+          <span className="tile-l">videos submitted</span>
+        </div>
+        <div className="tile">
+          <span className="tile-n">{rows ? done.length : "—"}</span>
+          <span className="tile-l">completed</span>
+        </div>
+        <div className="tile">
+          <span className="tile-n">{rows ? spent : "—"}</span>
+          <span className="tile-l">credits spent, all time</span>
+        </div>
+        <div className="tile">
+          <span className="tile-n">
+            {hw ? (hw.cuda_available ? "GPU" : "CPU") : "—"}
+          </span>
+          <span className="tile-l">
+            {hw && hw.cuda_available ? hw.gpu_name || "CUDA" : "no CUDA device"}
+          </span>
+        </div>
+      </div>
+
+      {error && (
+        <div className="notice error">
+          <strong>Could not load your history</strong>
+          {error}
+        </div>
+      )}
+
+      <div className="card">
+        <h2>Recent activity</h2>
+        {!rows && !error && <p className="hint">Loading…</p>}
+        {rows && rows.length === 0 && (
+          <p className="hint">
+            Nothing yet. <a href="#/tool">Upload your first video</a> — it costs{" "}
+            {credits ? `${credits.credits_per_video} credits` : "credits"}.
+          </p>
+        )}
+        {rows && rows.length > 0 && (
+          <React.Fragment>
+            <HistoryTable rows={rows.slice(0, 5)} />
+            {rows.length > 5 && (
+              <p className="hint" style={{ marginTop: 12, marginBottom: 0 }}>
+                <a href="#/history">See all {rows.length} runs</a>
+              </p>
+            )}
+          </React.Fragment>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------- History -- */
+
+function HistoryTable({ rows }) {
+  return (
+    <div className="table-scroll">
+      <table className="history">
+        <thead>
+          <tr>
+            <th>Video</th>
+            <th>When</th>
+            <th>Status</th>
+            <th className="num">Credits</th>
+            <th />
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r) => (
+            <tr key={r.job_id}>
+              <td className="fname" title={r.original_filename}>
+                {r.original_filename}
+              </td>
+              <td className="dim">{fmtWhen(r.created_at)}</td>
+              <td>
+                <span className={`pill ${r.status}`}>{r.status}</span>
+                {r.status === "failed" && r.error && (
+                  <span className="pill-note" title={r.error}>
+                    {r.error.length > 60 ? `${r.error.slice(0, 60)}…` : r.error}
+                  </span>
+                )}
+              </td>
+              <td className="num">{r.credits_used}</td>
+              <td className="num">
+                {r.has_output ? (
+                  <a
+                    className="btn ghost small"
+                    href={`/api/result/${r.job_id}/download`}
+                  >
+                    Download
+                  </a>
+                ) : (
+                  <span className="dim">
+                    {r.status === "completed" ? "file removed" : "—"}
+                  </span>
+                )}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function History({ onAuthLost }) {
+  const [rows, setRows] = useState(null);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    api("/api/history")
+      .then((d) => setRows(d.history || []))
+      .catch((e) => (e.status === 401 ? onAuthLost() : setError(e.message)));
+  }, [onAuthLost]);
+
+  return (
+    <div className="app">
+      <header className="masthead">
+        <div className="brand">
+          <h1>Your videos</h1>
+          <p>Every run recorded against your account.</p>
+        </div>
+        <a className="btn primary" href="#/tool">
+          Analyse a video
+        </a>
+      </header>
+
+      {error && (
+        <div className="notice error">
+          <strong>Could not load your history</strong>
+          {error}
+        </div>
+      )}
+
+      <div className="card">
+        {!rows && !error && <p className="hint">Loading…</p>}
+        {rows && rows.length === 0 && (
+          <p className="hint">
+            No videos yet. <a href="#/tool">Start with one</a>.
+          </p>
+        )}
+        {rows && rows.length > 0 && <HistoryTable rows={rows} />}
+        {rows && rows.length > 0 && (
+          <p className="hint" style={{ marginTop: 16, marginBottom: 0 }}>
+            Annotated videos are kept while there is room on disk; the oldest are
+            removed first, which is why an older run can show “file removed”.
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------- App -- */
+
+/* The shell: session, credits, health, and hash routing. Hash routing rather
+   than a router library because the whole site is four pages and the backend
+   serves index.html from one static mount - real paths would 404 on reload. */
+
+const ROUTES = ["/", "/login", "/register", "/dashboard", "/tool", "/history"];
+const PROTECTED = ["/dashboard", "/tool", "/history"];
+
+function currentRoute() {
+  const raw = (window.location.hash || "#/").replace(/^#/, "");
+  return ROUTES.includes(raw) ? raw : "/";
+}
+
+function App() {
+  const [route, setRoute] = useState(currentRoute);
+  const [user, setUser] = useState(null);
+  const [credits, setCredits] = useState(null);
+  const [health, setHealth] = useState(null);
+  // Distinct from "no user": until the session probe finishes we do not know,
+  // and rendering the login page in the meantime would flash it at someone who
+  // is in fact signed in.
+  const [ready, setReady] = useState(false);
+  const [flash, setFlash] = useState(null);
+
+  useEffect(() => {
+    const onHash = () => setRoute(currentRoute());
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  }, []);
+
+  const applySession = useCallback((data) => {
+    setUser(data.user);
+    setCredits({
+      credits_remaining: data.credits_remaining,
+      credits_total: data.credits_total,
+      credits_per_video: data.credits_per_video,
+      videos_today: data.videos_today,
+      videos_per_day: data.videos_per_day,
+      can_process: data.can_process,
+    });
+  }, []);
+
+  const refreshCredits = useCallback(() => {
+    api("/api/auth/me")
+      .then(applySession)
+      .catch(() => {
+        /* the 401 path is handled where the session is first established */
+      });
+  }, [applySession]);
+
+  // Session probe on load. A 401 here is the normal case for a visitor, not an
+  // error, so it is not surfaced.
+  useEffect(() => {
+    api("/api/auth/me")
+      .then(applySession)
+      .catch(() => setUser(null))
+      .finally(() => setReady(true));
+
+    fetch("/api/health")
+      .then((r) => r.json())
+      .then(setHealth)
+      .catch(() => setHealth({ status: "unreachable" }));
+  }, [applySession]);
+
+  const go = (path) => {
+    window.location.hash = `#${path}`;
+  };
+
+  const onAuthLost = useCallback(() => {
+    setUser(null);
+    setCredits(null);
+    setFlash("Your session expired. Please sign in again.");
+    go("/login");
+  }, []);
+
+  const logout = async () => {
+    try {
+      await api("/api/auth/logout", { method: "POST" });
+    } catch (e) {
+      /* the cookie is cleared server-side; a failure here changes nothing */
+    }
+    setUser(null);
+    setCredits(null);
+    go("/");
+  };
+
+  const afterAuth = (data) => {
+    applySession(data);
+    setFlash(null);
+    go("/dashboard");
+  };
+
+  // Signed-in users have no reason to see the auth pages.
+  useEffect(() => {
+    if (!ready) return;
+    if (user && (route === "/login" || route === "/register")) go("/dashboard");
+  }, [ready, user, route]);
+
+  let page;
+  if (!ready) {
+    page = <div className="boot">Loading TrafficIntel…</div>;
+  } else if (PROTECTED.includes(route) && !user) {
+    // The real gate is in FastAPI - every one of these endpoints requires a
+    // session, so editing this check in the browser gains nothing. This only
+    // avoids showing a page that could not work.
+    page = (
+      <div className="app">
+        <div className="notice info">
+          <strong>Sign in first</strong>
+          This page needs an account. <a href="#/login">Sign in</a> or{" "}
+          <a href="#/register">create one</a>.
+        </div>
+      </div>
+    );
+  } else if (route === "/login" || route === "/register") {
+    // key: without it React reuses one AuthForm across both routes, and a failed
+    // login's error message would follow the user onto the sign-up form.
+    page = <AuthForm key={route} mode={route.slice(1)} onDone={afterAuth} />;
+  } else if (route === "/dashboard") {
+    page = (
+      <Dashboard
+        user={user}
+        credits={credits}
+        health={health}
+        onAuthLost={onAuthLost}
+      />
+    );
+  } else if (route === "/history") {
+    page = <History onAuthLost={onAuthLost} />;
+  } else if (route === "/tool") {
+    page = (
+      <Tool
+        health={health}
+        credits={credits}
+        onCredits={refreshCredits}
+        onAuthLost={onAuthLost}
+      />
+    );
+  } else {
+    page = <Home user={user} health={health} />;
+  }
+
+  return (
+    <React.Fragment>
+      <Nav route={route} user={user} credits={credits} onLogout={logout} />
+      {flash && (
+        <div className="app">
+          <div className="notice info">{flash}</div>
+        </div>
+      )}
+      {page}
+    </React.Fragment>
   );
 }
 

@@ -87,5 +87,8 @@ $RECYCLE.BIN/
 .env
 .env.*
 !.env.example
+# Generated on first start when JWT_SECRET is not set in .env. Committing it
+# would publish the key that signs every login cookie.
+.jwt_secret
 *.pem
 *.key

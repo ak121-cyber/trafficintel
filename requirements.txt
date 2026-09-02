@@ -13,3 +13,11 @@ paddlepaddle
 fastapi
 uvicorn[standard]
 python-multipart
+
+# Accounts, credits and history. pymongo is the only MongoDB driver needed -
+# there is no ODM, because the whole schema is three small collections.
+# PyJWT signs the login cookie; 2.0 is the floor because 1.x returns bytes from
+# encode(). Password hashing uses hashlib.scrypt from the standard library, so
+# there is no bcrypt or passlib wheel to compile.
+pymongo>=4.0
+PyJWT>=2.0
