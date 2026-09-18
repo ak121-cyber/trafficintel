@@ -1,0 +1,8 @@
+{
+  "rewrites": [
+    {
+      "source": "/api/:path*",
+      "destination": "https://trafficintel.onrender.com/api/:path*"
+    }
+  ]
+}
