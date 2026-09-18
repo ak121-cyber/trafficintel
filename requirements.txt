@@ -6,7 +6,7 @@ PyYAML
 torch
 torchvision
 paddleocr
-paddlepaddle
+paddlepaddle==3.3.1
 
 # Web app (backend/app.py). python-multipart is required by FastAPI to parse
 # the multipart/form-data upload; without it /api/process fails at import time.
